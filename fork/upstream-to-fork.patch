@@ -1,0 +1,763 @@
+diff -ruN '--exclude=metadata.json' a/contents/code/multi-output.sh b/contents/code/multi-output.sh
+--- a/contents/code/multi-output.sh
++++ b/contents/code/multi-output.sh
+@@ -0,0 +1,84 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0-or-later
++#
++# multi-output.sh — combined output helper for io.github.lckt0.volume.
++#
++# Run by the applet only when the user toggles a checkbox or a checked device
++# is plugged in or removed; nothing runs in the background.
++#
++#   multi-output.sh load   <sink_name> <latency 0|1> <description> <sink>...
++#       Loads module-combine-sink into pipewire-pulse and prints the module
++#       index (pipewire-pulse implements it with libpipewire-module-combine-stream).
++#   multi-output.sh unload <module-index>
++#       Unloads a module only if this applet created it (sink_name=lckt0_multi_output_*).
++#   multi-output.sh list
++#       Lists this applet's modules (for debugging).
++#
++# Set PACTL to use a fake pactl in tests.
++
++set -eu
++
++PACTL=${PACTL:-pactl}
++PREFIX=lckt0_multi_output_
++
++die() { printf '%s\n' "$*" >&2; exit 2; }
++
++valid_name() {
++    case "$1" in
++        '' | *[!A-Za-z0-9_.:-]*) return 1 ;;
++    esac
++    return 0
++}
++
++cmd=${1:-}
++[ $# -gt 0 ] && shift
++
++case "$cmd" in
++load)
++    [ $# -ge 4 ] || die "usage: load <sink_name> <latency 0|1> <description> <sink>..."
++    name=$1 lat=$2 desc=$3
++    shift 3
++    valid_name "$name" || die "invalid sink name: $name"
++    case "$name" in "$PREFIX"*) ;; *) die "refusing sink name outside $PREFIX*: $name" ;; esac
++
++    slaves=
++    for s in "$@"; do
++        valid_name "$s" || die "invalid sink: $s"
++        case "$s" in "$PREFIX"*) die "cannot nest a combined sink: $s" ;; esac
++        slaves=${slaves:+$slaves,}$s
++    done
++
++    # No quotes or backslashes in the description (module argument parser).
++    desc=$(printf '%s' "$desc" | tr -d "\"'\\\\")
++    [ -n "$desc" ] || desc="Combined Output"
++
++    if [ "$lat" = 1 ]; then lc=true; else lc=false; fi
++
++    exec "$PACTL" load-module module-combine-sink \
++        "sink_name=$name" \
++        "sink_properties='node.description=\"$desc\" device.icon_name=\"audio-speakers\"'" \
++        "slaves=$slaves" \
++        "latency_compensate=$lc"
++    ;;
++unload)
++    [ $# -eq 1 ] || die "usage: unload <module-index>"
++    idx=$1
++    case "$idx" in '' | *[!0-9]*) die "invalid module index: $idx" ;; esac
++    # Only unload our own module, never another combine sink.
++    if ! "$PACTL" list modules short \
++        | awk -F '\t' -v i="$idx" -v p="sink_name=$PREFIX" \
++            '$1 == i && $2 == "module-combine-sink" && index($3, p) { found = 1 } END { exit !found }'
++    then
++        printf 'module %s is not ours, not unloading\n' "$idx" >&2
++        exit 3
++    fi
++    exec "$PACTL" unload-module "$idx"
++    ;;
++list)
++    "$PACTL" list modules short \
++        | awk -F '\t' -v p="sink_name=$PREFIX" '$2 == "module-combine-sink" && index($3, p)'
++    ;;
++*)
++    die "usage: multi-output.sh load|unload|list ..."
++    ;;
++esac
+diff -ruN '--exclude=metadata.json' a/contents/config/main.xml b/contents/config/main.xml
+--- a/contents/config/main.xml
++++ b/contents/config/main.xml
+@@ -48,6 +48,23 @@
+       <label>Whether to keep the popup open after losing focus</label>
+       <default>false</default>
+     </entry>
++    <!-- io.github.lckt0.volume additions -->
++    <entry name="multiOutputEnabled" type="Bool">
++      <label>Whether several output devices can be checked to play at the same time</label>
++      <default>false</default>
++    </entry>
++    <entry name="multiOutputSinks" type="StringList">
++      <label>Node names of the checked output devices</label>
++      <default></default>
++    </entry>
++    <entry name="multiOutputLatencyCompensate" type="Bool">
++      <label>Delay faster outputs so that all checked outputs are in sync (e.g. speakers vs. Bluetooth)</label>
++      <default>true</default>
++    </entry>
++    <entry name="levelMeters" type="Bool">
++      <label>Show live level meters on the sliders while the popup is open</label>
++      <default>true</default>
++    </entry>
+   </group>
+ 
+ </kcfg>
+diff -ruN '--exclude=metadata.json' a/contents/ui/ListItemBase.qml b/contents/ui/ListItemBase.qml
+--- a/contents/ui/ListItemBase.qml
++++ b/contents/ui/ListItemBase.qml
+@@ -26,11 +26,16 @@
+     property string /* "sink" | "sink-input" | "source" | "source-output" */ type
+     property string fullNameToShowOnHover: ""
+     readonly property bool isStream: item.type === "sink-input" || item.type === "source-output"
++    // io.github.lckt0.volume: with "Play on multiple devices" on, output rows get
++    // a checkbox instead of the default-device radio button.
++    readonly property bool multiMode: item.type === "sink" && main.multiOutput.enabled
++                                      && !main.multiOutput.isOurs(item.model.Name)
++    readonly property bool multiChecked: multiMode && main.multiOutput.isMember(item.model.Name)
+ 
+     highlighted: dropArea.containsDrag
+     background.visible: highlighted
+     opacity: (main.draggedStream && main.draggedStream.deviceIndex === item.model.Index) ? 0.3 : 1.0
+-    checked: defaultButton.visible ? defaultButton.checked : !muteButton.checked
++    checked: selectorRow.visible ? (item.multiMode ? memberButton.checked : defaultButton.checked) : !muteButton.checked
+     Accessible.name: label
+     Accessible.description: percentText.text
+     Accessible.onIncreaseAction: slider.increase()
+@@ -114,12 +119,14 @@
+                 spacing: Kirigami.Units.smallSpacing
+ 
+                 RowLayout {
++                    id: selectorRow
+                     spacing: 0
+                     Layout.maximumWidth: Infinity // Ignore maximum width of children
+-                    visible: (item.type === "sink" || item.type === "source") && item.ListView.view.count > 1
++                    visible: (item.type === "sink" || item.type === "source") && (item.ListView.view.count > 1 || item.multiMode)
+ 
+                     PC3.RadioButton {
+                         id: defaultButton
++                        visible: !item.multiMode
+                         // Maximum width of the button need to match the text. Empty area must not change the default device.
+                         Layout.maximumWidth: item.availableWidth - Layout.leftMargin - Layout.rightMargin
+                             - (contextMenuButton.visible ? contextMenuButton.implicitWidth + Kirigami.Units.smallSpacing * 2 : 0)
+@@ -135,6 +142,23 @@
+                             }
+                         }
+                     }
++
++                    PC3.CheckBox {
++                        id: memberButton
++                        visible: item.multiMode
++                        text: defaultButton.text
++                        Layout.maximumWidth: defaultButton.Layout.maximumWidth
++                        Layout.leftMargin: defaultButton.Layout.leftMargin
++                        Layout.rightMargin: defaultButton.Layout.rightMargin
++                        spacing: defaultButton.spacing
++                        Accessible.ignored: true // read out from delegate
++                        activeFocusOnTab: false // toggle from delegate
++                        checked: item.multiChecked
++                        onToggled: {
++                            main.multiOutput.toggle(item.model.Name);
++                            checked = Qt.binding(() => item.multiChecked);
++                        }
++                    }
+                 }
+ 
+                 Item {
+@@ -142,7 +166,7 @@
+                     Layout.leftMargin: (item.ListView.view.otherViewHasRadioButtons && !item.isStream)
+                         ? (defaultButton.Layout.leftMargin - Layout.margins) + defaultButton.indicator.width + defaultButton.spacing
+                         : Layout.margins
+-                    visible: !defaultButton.visible
++                    visible: !selectorRow.visible
+                     implicitHeight: Math.max(friendlyDescriptionLabel.implicitHeight, longDescriptionLabel.implicitHeight)
+ 
+                     // User-friendly name
+@@ -220,7 +244,7 @@
+                 SmallToolButton {
+                     id: muteButton
+                     readonly property bool isPlayback: item.type.startsWith("sink")
+-                    Layout.leftMargin:  (defaultButton.visible  ||  (item.ListView.view.otherViewHasRadioButtons && !item.isStream))
++                    Layout.leftMargin:  (selectorRow.visible  ||  (item.ListView.view.otherViewHasRadioButtons && !item.isStream))
+                         ? defaultButton.indicator.width + defaultButton.spacing : Layout.margins
+                     icon.name: AudioIcon.forVolume(volumePercent(item.model.Volume), item.model.Muted, isPlayback ? "audio-volume" : "microphone-sensitivity")
+                     onClicked: toggleMuteItem()
+@@ -409,6 +433,10 @@
+     }
+ 
+     function setAsDefault(): void {
++        if (item.multiMode) {
++            main.multiOutput.toggle(item.model.Name);
++            return;
++        }
+         if (type === "sink" || type === "source") {
+             model.PulseObject.default = true;
+         }
+diff -ruN '--exclude=metadata.json' a/contents/ui/main.qml b/contents/ui/main.qml
+--- a/contents/ui/main.qml
++++ b/contents/ui/main.qml
+@@ -17,6 +17,7 @@
+ 
+ import org.kde.kcmutils as KCMUtils
+ import org.kde.config as KConfig
++import org.kde.plasma.plasma5support as P5Support
+ 
+ import org.kde.plasma.private.volume
+ 
+@@ -155,11 +156,25 @@
+     // Confusingly, Source Output is what PulseAudio calls streams that take audio from an input device
+     readonly property SourceOutputModel paSourceOutputModel: SourceOutputModel { id: paSourceOutputModel }
+ 
++    // io.github.lckt0.volume: on-demand combined output (see MultiOutput.qml)
++    readonly property MultiOutput multiOutput: MultiOutput {
++        sinkModel: paSinkModel
++    }
++
+     // active output devices
+     readonly property PulseObjectFilterModel paSinkFilterModel: PulseObjectFilterModel {
+         id: paSinkFilterModel
+         filterOutInactiveDevices: true
+         filterVirtualDevices: !main.showVirtualDevices
++        // the combined sink is shown separately, above the device list
++        filters: [ { role: "Name", value: (name) => !main.multiOutput.isOurs(name) } ]
++        sourceModel: paSinkModel
++    }
++
++    // io.github.lckt0.volume: the combined sink itself (master volume row)
++    readonly property PulseObjectFilterModel paCombinedSinkFilterModel: PulseObjectFilterModel {
++        id: paCombinedSinkFilterModel
++        filters: [ { role: "Name", value: main.multiOutput.enabled ? main.multiOutput.activeSinkName : "\u0000" } ]
+         sourceModel: paSinkModel
+     }
+ 
+@@ -177,10 +192,17 @@
+         filters: [
+             { role: "VirtualStream", value: false },
+             { role: "Client", value: (client) => client.name !== "libcanberra" },
++            // io.github.lckt0.volume: hide the combined sink's per-device streams
++            { role: "Properties", value: (properties) => !main.multiOutput.isOwnStream(properties) },
+         ]
+         sourceModel: paSinkInputModel
+     }
+ 
++    Connections {
++        target: main.multiOutput
++        function onModulesChanged() { paSinkInputFilterModel.invalidate() }
++    }
++
+     // non-virtual streams coming from input devices
+     readonly property PulseObjectFilterModel paSourceOutputFilterModel: PulseObjectFilterModel {
+         id: paSourceOutputFilterModel
+@@ -605,6 +627,46 @@
+                                     return ""
+                             }
+                         }
++
++                        // io.github.lckt0.volume: multi-output toggle. A plain 16px icon
++                        // (not a ToolButton) so the section header keeps its stock height.
++                        Kirigami.Icon {
++                            id: multiOutputToggle
++                            readonly property string text: i18nc("@action:button", "Play on Multiple Devices")
++                            visible: scrollView.upperType === "sink"
++                            Layout.alignment: Qt.AlignVCenter
++                            implicitWidth: Kirigami.Units.iconSizes.small
++                            implicitHeight: Kirigami.Units.iconSizes.small
++                            source: main.multiOutput.enabled ? "checkbox-checked-symbolic" : "checkbox-symbolic"
++                            active: toggleHover.hovered || activeFocus
++                            activeFocusOnTab: visible
++                            Accessible.role: Accessible.CheckBox
++                            Accessible.name: text
++                            Accessible.checkable: true
++                            Accessible.checked: main.multiOutput.enabled
++                            Accessible.onPressAction: main.multiOutput.setEnabled(!main.multiOutput.enabled)
++                            Keys.onSpacePressed: main.multiOutput.setEnabled(!main.multiOutput.enabled)
++                            HoverHandler { id: toggleHover; cursorShape: Qt.PointingHandCursor }
++                            TapHandler { onTapped: main.multiOutput.setEnabled(!main.multiOutput.enabled) }
++                            PC3.ToolTip.text: text
++                            PC3.ToolTip.visible: toggleHover.hovered || activeFocus
++                            PC3.ToolTip.delay: Kirigami.Units.toolTipDelay
++                        }
++                    }
++
++                    // io.github.lckt0.volume: master volume of the combined output
++                    ListView {
++                        id: combinedSection
++                        property bool otherViewHasRadioButtons: upperSection.visible && (upperSection.count > 1 || main.multiOutput.enabled)
++                        visible: scrollView.upperType === "sink" && count > 0 && !fullRep.hiddenTypes.includes("sink")
++                        interactive: false
++                        Layout.fillWidth: true
++                        implicitHeight: contentHeight
++                        model: scrollView.upperType === "sink" ? main.paCombinedSinkFilterModel : null
++                        delegate: DeviceListItem {
++                            width: ListView.view.width
++                            type: "sink"
++                        }
+                     }
+ 
+                     ListView {
+@@ -668,7 +730,8 @@
+                     }
+                     ListView {
+                         id: lowerSection
+-                        property bool otherViewHasRadioButtons: upperSection.visible && (upperSection.count > 1)
++                        property bool otherViewHasRadioButtons: upperSection.visible && (upperSection.count > 1
++                            || (scrollView.upperType === "sink" && main.multiOutput.enabled)) // io.github.lckt0.volume
+                         visible: count && !fullRep.hiddenTypes.includes(scrollView.lowerType)
+                         interactive: false
+                         Layout.fillWidth: true
+@@ -757,8 +820,27 @@
+         id: kded
+     }
+ 
++    P5Support.DataSource {
++        id: launcher
++        engine: "executable"
++        connectedSources: []
++        onNewData: (sourceName, data) => disconnectSource(sourceName)
++    }
++
+     Plasmoid.contextualActions: [
+         PlasmaCore.Action {
++            text: i18nc("@action:inmenu", "Play on Multiple Devices")
++            icon.name: "checkbox-symbolic"
++            checkable: true
++            checked: main.multiOutput.enabled
++            onTriggered: main.multiOutput.setEnabled(!main.multiOutput.enabled)
++        },
++        PlasmaCore.Action {
++            text: i18nc("@action:inmenu qpwgraph is an application name", "Open Audio Patchbay (qpwgraph)…")
++            icon.name: "org.rncbc.qpwgraph"
++            onTriggered: launcher.connectSource("kstart --application org.rncbc.qpwgraph")
++        },
++        PlasmaCore.Action {
+             text: i18n("Force mute all playback devices")
+             icon.name: "audio-volume-muted" + (Qt.application.layoutDirection === Qt.RightToLeft ? "-rtl" : "");
+             checkable: true
+diff -ruN '--exclude=metadata.json' a/contents/ui/MultiOutput.qml b/contents/ui/MultiOutput.qml
+--- a/contents/ui/MultiOutput.qml
++++ b/contents/ui/MultiOutput.qml
+@@ -0,0 +1,388 @@
++/*
++    SPDX-FileCopyrightText: 2026 lckt0
++    SPDX-License-Identifier: GPL-2.0-or-later
++
++    Multi-output controller for io.github.lckt0.volume.
++
++    Backend: pipewire-pulse "module-combine-sink" (internally
++    libpipewire-module-combine-stream). It is created on demand when two or more
++    outputs are checked and unloaded again when fewer than two remain. Nothing
++    here polls: every action is driven by a user click or by a sink/module
++    add/remove event coming from the existing PulseAudio context.
++
++    PulseAudioQt::Context::loadModule() exists but is not Q_INVOKABLE and the
++    plasma-pa QML plugin does not expose it, so loading/unloading goes through a
++    one-shot `pactl` call (Plasma5Support "executable" engine, no interval).
++*/
++
++import QtQuick
++
++import org.kde.plasma.plasmoid
++import org.kde.plasma.plasma5support as P5Support
++import org.kde.kitemmodels as KItemModels
++
++import org.kde.plasma.private.volume
++
++QtObject {
++    id: mo
++
++    required property SinkModel sinkModel
++
++    // Every combined sink this applet creates is named <prefix>a or <prefix>b.
++    // Alternating the name lets us build the new sink, move the default to it
++    // and only then unload the old one, so changing the set does not route
++    // audio through a random fallback device for a moment.
++    readonly property string sinkPrefix: "lckt0_multi_output_"
++    readonly property string combinedDescription: i18nc("@label name of the virtual output that plays on several devices", "Combined Output")
++
++    readonly property bool enabled: Plasmoid.configuration.multiOutputEnabled
++    readonly property var members: Plasmoid.configuration.multiOutputSinks
++    readonly property bool latencyCompensate: Plasmoid.configuration.multiOutputLatencyCompensate
++
++    // [{ index: int, sinkName: string, slaves: [string] }], rebuilt from ModuleModel,
++    // minus modules we already asked to unload.
++    property var modules: []
++    readonly property var active: pickActive(modules)
++    readonly property string activeSinkName: active ? active.sinkName : ""
++    readonly property var activeSlaves: active ? active.slaves : []
++
++    property int inFlight: 0
++    property string pendingDefault: ""
++    // Name of a sink we just loaded but that ModuleModel does not list yet.
++    // The PulseAudio introspection events for the sink and for the module
++    // arrive separately; without this, sync() could see "no module" in
++    // between and load a second one.
++    property string awaitingModule: ""
++    // Module indexes we asked to unload (index -> true) until they disappear.
++    property var unloading: ({})
++    property string lastError: ""
++    property string lastFailedKey: ""
++    property bool settled: false
++    readonly property bool contextReady: Context.state === Context.State.Ready
++
++    readonly property url scriptUrl: Qt.resolvedUrl("../code/multi-output.sh")
++    property int runSerial: 0
++    property var callbacks: ({})
++
++    // ---- public API used by the UI -------------------------------------
++
++    function isOurs(name) {
++        return typeof name === "string" && name.startsWith(sinkPrefix)
++    }
++
++    function isMember(name) {
++        return (members || []).includes(name)
++    }
++
++    // True for the internal per-device streams of our combined sink, so the
++    // "Applications" tab does not list them as if they were apps.
++    function isOwnStream(properties) {
++        if (!properties) {
++            return false
++        }
++        const id = properties["pulse.module.id"]
++        if (id === undefined) {
++            return false
++        }
++        return modules.some(m => String(m.index) === String(id))
++    }
++
++    function setEnabled(on) {
++        if (on === enabled) {
++            return
++        }
++        if (on) {
++            const def = PreferredDevice.sink
++            const seed = (def && !isOurs(def.name) && def.name !== "auto_null") ? [def.name] : []
++            Plasmoid.configuration.multiOutputSinks = seed
++            Plasmoid.configuration.multiOutputEnabled = true
++        } else {
++            const target = (members || []).find(n => sinkByName(n) !== null) || ""
++            Plasmoid.configuration.multiOutputEnabled = false
++            Plasmoid.configuration.multiOutputSinks = []
++            if (modules.length > 0) {
++                dissolve(target)
++            }
++        }
++    }
++
++    function toggle(name) {
++        if (!enabled || isOurs(name)) {
++            return
++        }
++        let list = (members || []).slice()
++        if (list.includes(name)) {
++            if (list.length <= 1) {
++                return // keep at least one output checked
++            }
++            list = list.filter(n => n !== name)
++        } else {
++            list.push(name)
++        }
++        Plasmoid.configuration.multiOutputSinks = list
++        lastFailedKey = ""
++        if (list.length === 1 && modules.length === 0) {
++            const sink = sinkByName(list[0])
++            if (sink) {
++                sink.default = true
++            }
++        }
++        Qt.callLater(sync)
++    }
++
++    // ---- internals -------------------------------------------------------
++
++    function pickActive(list) {
++        if (list.length === 0) {
++            return null
++        }
++        const def = PreferredDevice.sink
++        const byDefault = def ? list.find(m => m.sinkName === def.name) : undefined
++        return byDefault || list[list.length - 1]
++    }
++
++    function roleOf(model, name) {
++        return model.KItemModels.KRoleNames.role(name)
++    }
++
++    function sinkByName(name) {
++        if (!name) {
++            return null
++        }
++        const role = roleOf(sinkModel, "PulseObject")
++        for (let i = 0; i < sinkModel.rowCount(); ++i) {
++            const obj = sinkModel.data(sinkModel.index(i, 0), role)
++            if (obj && obj.name === name) {
++                return obj
++            }
++        }
++        return null
++    }
++
++    function parseSlaves(argument) {
++        const m = /(?:^|\s)(?:slaves|sinks)=(\S+)/.exec(argument || "")
++        return m ? m[1].split(",").filter(s => s.length > 0) : []
++    }
++
++    function refreshModules() {
++        const role = roleOf(moduleModel, "PulseObject")
++        const re = new RegExp("(?:^|\\s)sink_name=(" + sinkPrefix + "[A-Za-z0-9_]+)(?:\\s|$)")
++        const out = []
++        const seen = {}
++        for (let i = 0; i < moduleModel.rowCount(); ++i) {
++            const module = moduleModel.data(moduleModel.index(i, 0), role)
++            if (!module || module.name !== "module-combine-sink") {
++                continue
++            }
++            const m = re.exec(module.argument || "")
++            if (!m) {
++                continue
++            }
++            seen[module.index] = true
++            if (m[1] === awaitingModule) {
++                awaitingModule = ""
++                awaitTimer.stop()
++            }
++            if (!unloading[module.index]) {
++                out.push({ index: module.index, sinkName: m[1], slaves: parseSlaves(module.argument) })
++            }
++        }
++        for (const idx of Object.keys(unloading)) {
++            if (!seen[idx]) {
++                delete unloading[idx]
++            }
++        }
++        modules = out
++    }
++
++    function shellQuote(s) {
++        return "'" + String(s).replace(/'/g, "'\\''") + "'"
++    }
++
++    function run(args, callback) {
++        const path = decodeURIComponent(String(scriptUrl).replace(/^file:\/\//, ""))
++        runSerial += 1
++        // The trailing comment only keeps command strings unique for the engine.
++        const cmd = "/bin/sh " + [path].concat(args).map(shellQuote).join(" ") + " #" + runSerial
++        callbacks[cmd] = callback
++        inFlight += 1
++        runner.connectSource(cmd)
++    }
++
++    function finished(cmd, data) {
++        runner.disconnectSource(cmd)
++        const cb = callbacks[cmd]
++        delete callbacks[cmd]
++        inFlight = Math.max(0, inFlight - 1)
++        const code = data["exit code"]
++        const out = (data.stdout || "").trim()
++        const err = (data.stderr || "").trim()
++        if (code !== 0) {
++            console.warn("io.github.lckt0.volume: multi-output helper failed", code, err || out)
++        }
++        if (cb) {
++            cb(code, out, err)
++        }
++        Qt.callLater(sync)
++    }
++
++    function build(slaves) {
++        const name = sinkPrefix + (activeSinkName === sinkPrefix + "a" ? "b" : "a")
++        const key = slaves.slice().sort().join(",")
++        run(["load", name, latencyCompensate ? "1" : "0", combinedDescription].concat(slaves), (code, out, err) => {
++            if (code !== 0) {
++                lastError = err || out || ("exit " + code)
++                lastFailedKey = key
++                return
++            }
++            lastError = ""
++            lastFailedKey = ""
++            awaitingModule = name
++            awaitTimer.restart()
++            refreshModules() // it may already be listed
++            pendingDefault = name
++            applyPendingDefault()
++        })
++    }
++
++    function unloadModules(keepSinkName) {
++        const doomed = modules.filter(m => m.sinkName !== keepSinkName)
++        if (doomed.length === 0) {
++            return
++        }
++        for (const m of doomed) {
++            unloading[m.index] = true
++            run(["unload", String(m.index)], () => {})
++        }
++        modules = modules.filter(m => m.sinkName === keepSinkName)
++    }
++
++    function dissolve(targetName) {
++        const target = sinkByName(targetName)
++        if (target) {
++            target.default = true // move streams first, then remove the combined sink
++        }
++        unloadModules("")
++    }
++
++    function applyPendingDefault() {
++        if (!pendingDefault) {
++            return
++        }
++        const sink = sinkByName(pendingDefault)
++        if (!sink) {
++            return // wait for the sink to show up in the model
++        }
++        const keep = pendingDefault
++        sink.default = true
++        pendingDefault = ""
++        unloadModules(keep)
++    }
++
++    function sync() {
++        if (!contextReady || !settled || inFlight > 0 || pendingDefault || awaitingModule) {
++            return
++        }
++        const list = members || []
++
++        if (!enabled || list.length < 2) {
++            if (modules.length > 0) {
++                dissolve(list.find(n => sinkByName(n) !== null) || "")
++            }
++            return
++        }
++
++        const present = list.filter(n => !isOurs(n) && sinkByName(n) !== null)
++
++        if (!active) {
++            if (present.length >= 2 && present.slice().sort().join(",") !== lastFailedKey) {
++                build(present)
++            }
++            return
++        }
++
++        // A checked device that the running combined sink does not cover
++        // (plugged in later, or newly checked) -> rebuild. A device that was
++        // merely disconnected is left alone: combine-stream re-attaches it by
++        // node.name when it comes back.
++        const missing = present.filter(n => !activeSlaves.includes(n))
++        const removed = activeSlaves.filter(n => !list.includes(n))
++        if (missing.length > 0 || removed.length > 0) {
++            if (present.length >= 2) {
++                if (present.slice().sort().join(",") !== lastFailedKey) {
++                    build(present)
++                }
++            } else {
++                dissolve(present[0] || "")
++            }
++            return
++        }
++
++        if (modules.length > 1) {
++            unloadModules(activeSinkName) // leftovers, e.g. after a plasmashell restart mid-switch
++        }
++    }
++
++    // ---- objects ---------------------------------------------------------
++
++    readonly property ModuleModel moduleModel: ModuleModel {}
++
++    readonly property P5Support.DataSource runner: P5Support.DataSource {
++        engine: "executable"
++        connectedSources: []
++        onNewData: (sourceName, data) => mo.finished(sourceName, data)
++    }
++
++    // One-shot grace period after connecting so the initial sink/module
++    // enumeration is complete before we decide anything. Not a poll.
++    readonly property Timer settleTimer: Timer {
++        interval: 1500
++        repeat: false
++        running: mo.contextReady && !mo.settled
++        onTriggered: {
++            mo.refreshModules()
++            mo.settled = true
++            mo.sync()
++        }
++    }
++
++    // Safety net: if the module never shows up in ModuleModel, stop waiting.
++    readonly property Timer awaitTimer: Timer {
++        interval: 5000
++        repeat: false
++        onTriggered: {
++            mo.awaitingModule = ""
++            mo.refreshModules()
++            Qt.callLater(mo.sync)
++        }
++    }
++
++    readonly property Connections moduleWatcher: Connections {
++        target: mo.moduleModel
++        function onRowsInserted() { mo.refreshModules(); Qt.callLater(mo.sync) }
++        function onRowsRemoved() { mo.refreshModules(); Qt.callLater(mo.sync) }
++        function onModelReset() { mo.refreshModules(); Qt.callLater(mo.sync) }
++    }
++
++    readonly property Connections sinkWatcher: Connections {
++        target: mo.sinkModel
++        function onRowsInserted() { Qt.callLater(mo.applyPendingDefault); Qt.callLater(mo.sync) }
++        function onRowsRemoved() { Qt.callLater(mo.sync) }
++    }
++
++    // With multi-output on but fewer than two outputs checked there is no
++    // combined sink; keep the single checked entry in step with the default
++    // device if it is changed elsewhere (System Settings, kded, WirePlumber).
++    readonly property Connections defaultWatcher: Connections {
++        target: PreferredDevice
++        function onSinkChanged() {
++            const sink = PreferredDevice.sink
++            if (!mo.enabled || mo.modules.length > 0 || mo.inFlight > 0 || mo.pendingDefault || mo.awaitingModule) {
++                return
++            }
++            if ((mo.members || []).length <= 1 && sink && !mo.isOurs(sink.name) && sink.name !== "auto_null") {
++                Plasmoid.configuration.multiOutputSinks = [sink.name]
++            }
++        }
++    }
++}
+diff -ruN '--exclude=metadata.json' a/contents/ui/VolumeSlider.qml b/contents/ui/VolumeSlider.qml
+--- a/contents/ui/VolumeSlider.qml
++++ b/contents/ui/VolumeSlider.qml
+@@ -12,6 +12,7 @@
+ import org.kde.plasma.components as PC3
+ import org.kde.ksvg as KSvg
+ import org.kde.kirigami as Kirigami
++import org.kde.plasma.plasmoid
+ import org.kde.plasma.private.volume
+ 
+ // Audio volume slider. Value represents desired volume level in
+@@ -35,7 +36,13 @@
+ 
+     VolumeMonitor {
+         id: meter
+-        target: control.visible && control.showVolumeIndicator ? control.volumeObject : null
++        // io.github.lckt0.volume: stock plasma-pa keeps these peak-meter capture
++        // streams ("PlasmaPA-VolumeMeter") alive after the popup is closed,
++        // because Item.visible stays true inside a hidden popup window. That
++        // keeps the sound card and the PipeWire graph running while idle.
++        // Only meter while the popup is actually open.
++        target: control.visible && control.showVolumeIndicator
++                && main.expanded && Plasmoid.configuration.levelMeters ? control.volumeObject : null
+     }
+ 
+     Behavior on volume {

@@ -1,0 +1,9 @@
+pkg/
+src/
+*.pkg.tar.*
+*.tar.gz
+*.log
+test/out/
+*.orig
+*.rej
+*.bak
